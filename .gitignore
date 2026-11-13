@@ -1,0 +1,10 @@
+# Never commit credentials or collected data
+credentials.json
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor backups
+*~

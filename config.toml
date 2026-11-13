@@ -1,0 +1,77 @@
+# =============================================================================
+# Configuration for the Kia EV data collector (collect.py) and range
+# analyser (analyze.py).  Login credentials live separately in
+# credentials.json (kept apart from code/config for security).
+# Every key shown here is optional - built-in defaults (DEFAULTS in
+# kia_common.py) are used for anything omitted.
+# =============================================================================
+
+[vehicle]
+# VIN (or API vehicle id) of the vehicle to monitor.
+# "" = use the first vehicle returned by the Kia Connect API.
+vin = ""
+
+[paths]
+# Relative paths are resolved relative to this folder (/home/graham/kia).
+data_dir = "data"                  # created automatically on first run
+samples_file = "samples.csv"       # one appended row per collect.py run
+daily_file = "daily.csv"           # per-day driving stats, refreshed on every run
+graph_file = "range_analysis.png"  # written by analyze.py
+
+[battery]
+# Usable battery capacity in kWh - used to convert "kWh used per day" into a
+# range estimate.  Also the fallback / sanity reference for the API-reported
+# capacity (see capacity_source below).
+#
+# Note: the API field ev_battery_capacity returns 256320 for the PV5.  Its
+# unit is undocumented, but 256320 / 3600 = 71.2 kWh exactly, which matches
+# the PV5 long-range pack, so "auto" mode interprets the raw value as
+# kilojoules.  analyze.py also reports an "implied capacity" computed from
+# your real driving data (kWh used vs battery-% drop) so you can verify this
+# over time and adjust capacity_kwh if needed.
+capacity_kwh = 71.2
+
+# Where the capacity used for range estimates comes from:
+#   "auto"   - use the API value (scaled by api_capacity_kwh_per_unit) when it
+#              is within capacity_sanity_tolerance of capacity_kwh, otherwise
+#              fall back to capacity_kwh.  (Recommended)
+#   "api"    - always use the API value.
+#   "config" - always use capacity_kwh.
+capacity_source = "auto"
+
+# kWh per raw API capacity unit.  1/3600 assumes the API reports kilojoules.
+api_capacity_kwh_per_unit = 0.00027777778
+
+# In "auto" mode, an API-derived capacity that differs from capacity_kwh by
+# more than this fraction (0.25 = 25%) is rejected and capacity_kwh is used.
+capacity_sanity_tolerance = 0.25
+
+[schedule]
+# collect.py labels each run as either:
+#   "post_charge" - taken after the overnight charge finished, i.e. the
+#                   battery level at the START of the day.  Assumed when the
+#                   local hour is earlier than morning_cutoff_hour.
+#   "pre_charge"  - taken just before the overnight charge starts, i.e. the
+#                   battery level at the END of the day.  Assumed when the
+#                   local hour is >= morning_cutoff_hour.
+# Cron jobs should pass --sample-type explicitly; this rule covers manual runs.
+morning_cutoff_hour = 12
+
+# IANA timezone used to interpret "the day" (e.g. "Europe/London").
+# "" = use the server's local timezone.
+timezone = ""
+
+[api]
+retry_count = 2            # extra attempts if the Kia Connect API call fails
+retry_delay_seconds = 30   # pause between attempts
+
+[analysis]
+rolling_window_days = 7           # rolling-average window (calendar days)
+plan_max_pct = 100                # planning range assumes we start at this SOC
+plan_min_pct = 20                 # ... and only discharge down to this SOC
+min_pct_delta = 2                 # min battery-% drop for the %-based estimate
+min_distance_km = 1.0             # min daily distance for either estimate
+min_kwh_used = 0.2                # min daily kWh for the kWh-based estimate
+capacity_check_min_pct_delta = 5  # min battery-% drop for the implied-capacity diagnostic
+min_range_km = 150                # plausibility band: a full-charge range
+max_range_km = 500                # estimate outside this is rejected (glitch)
