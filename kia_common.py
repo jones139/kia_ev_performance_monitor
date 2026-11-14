@@ -6,6 +6,9 @@ data collector) and analyze.py (the range analysis / graphing script):
   * loading the TOML configuration file (config.toml)
   * loading the JSON credentials file (credentials.json), which is kept
     separate from code and configuration for security
+  * caching the Kia Connect authentication token between runs, so a
+    short-lived script (collect.py, run twice a day from cron) can reuse
+    the refresh token instead of logging in with the password every time
   * connecting to the Kia Connect API and refreshing vehicle state
   * resolving the usable battery capacity (config value vs. API value)
   * small unit / path / timestamp helpers
@@ -13,6 +16,9 @@ data collector) and analyze.py (the range analysis / graphing script):
 Public interface (functions):
     load_config(path=None)                    -> dict
     load_credentials(path=None)               -> dict
+    token_cache_path(credentials_path=None)   -> Path
+    load_cached_token(path=None)              -> Token | None
+    save_cached_token(token, path=None)       -> Path
     get_timezone(config)                      -> datetime.tzinfo
     paths_from_config(config)                 -> dict[str, Path]
     refresh_vehicles(vm, retries, delay)      -> None
@@ -42,6 +48,7 @@ logger = logging.getLogger("kia")
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.toml"
 DEFAULT_CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
+DEFAULT_TOKEN_PATH = SCRIPT_DIR / "credentials.token.json"
 
 # Built-in defaults, mirroring config.toml.  Any key missing from the user's
 # config file falls back to the value here, so config.toml may be minimal.
@@ -162,13 +169,94 @@ def load_credentials(path: str | Path | None = None) -> dict:
     return credentials
 
 
-def connect_vehicle_manager(credentials: dict):
+def token_cache_path(credentials_path: str | Path | None = None) -> Path:
+    """Return the token cache file that belongs with a credentials file.
+
+    Interface: ``credentials_path`` is optional (default: credentials.json
+    next to this file).  Returns a sibling path such as
+    ``credentials.token.json``.  Keeping the cache next to the credentials
+    means a custom ``--credentials`` file automatically gets its own token
+    cache, and the cache lives in the same protected directory.
+    """
+    cred_path = Path(credentials_path) if credentials_path else DEFAULT_CREDENTIALS_PATH
+    return cred_path.with_name(f"{cred_path.stem}.token.json")
+
+
+def load_cached_token(path: str | Path | None = None):
+    """Load a previously saved Kia Connect Token from disk.
+
+    Interface: ``path`` is optional (default: credentials.token.json next
+    to this file).  Returns a hyundai_kia_connect_api.Token, or None when
+    the file is absent or unreadable/corrupt.  Authentication problems are
+    not fatal here: callers simply fall back to a normal password login.
+    The API library is imported lazily so offline scripts do not need it.
+    """
+    token_path = Path(path) if path else DEFAULT_TOKEN_PATH
+    if not token_path.exists():
+        return None
+    try:
+        from hyundai_kia_connect_api import Token
+
+        with open(token_path, "r", encoding="utf-8") as handle:
+            token = Token.from_dict(json.load(handle))
+    except Exception as error:  # noqa: BLE001 - corrupt cache must not break a run
+        logger.warning(
+            "Could not read cached authentication token %s (%s); "
+            "will log in with the stored credentials",
+            token_path, error,
+        )
+        return None
+    logger.debug("Loaded cached authentication token from %s", token_path)
+    return token
+
+
+def save_cached_token(token, path: str | Path | None = None) -> Path:
+    """Persist a Kia Connect Token for reuse by the next run.
+
+    Interface: takes the Token returned/updated by the VehicleManager and
+    an optional destination path (default: credentials.token.json next to
+    this file).  Writes JSON atomically with mode 0600 (the token carries
+    the refresh token, so it is as sensitive as the password) and returns
+    the path written.  Raises OSError if the file cannot be written.
+    """
+    if token is None:
+        raise ValueError("cannot save an empty authentication token")
+    token_path = Path(path) if path else DEFAULT_TOKEN_PATH
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = token_path.with_name(token_path.name + ".tmp")
+    payload = token.to_dict() if hasattr(token, "to_dict") else dict(vars(token))
+
+    # Create the temporary file with restrictive permissions before writing.
+    descriptor = os.open(
+        temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, token_path)
+        os.chmod(token_path, 0o600)
+    except BaseException:
+        # Do not leave a partial token file behind (the next run would just
+        # log in again, but a stale .tmp file is untidy).
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return token_path
+
+
+def connect_vehicle_manager(credentials: dict, token=None):
     """Create a Kia Connect VehicleManager from the given credentials.
 
-    Interface: takes the dict returned by load_credentials() and returns an
-    unauthenticated hyundai_kia_connect_api.VehicleManager instance.  The
-    API library is imported here (lazily) so that scripts which only read
-    CSV data do not need it installed.
+    Interface: takes the dict returned by load_credentials() and an
+    optional previously cached Token (from load_cached_token()).  Returns a
+    hyundai_kia_connect_api.VehicleManager instance.  When ``token`` is
+    supplied the manager reuses it instead of performing a password login
+    (it refreshes the short-lived access token as needed).  The API library
+    is imported here (lazily) so that scripts which only read CSV data do
+    not need it installed.
     """
     from hyundai_kia_connect_api import VehicleManager
 
@@ -178,6 +266,7 @@ def connect_vehicle_manager(credentials: dict):
         username=credentials["username"],
         password=credentials["password"],
         pin=credentials["pin"],
+        token=token,
     )
 
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 import csv
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 try:
     import support  # noqa: F401  (sets up sys.path)
@@ -198,6 +200,139 @@ class UpsertDailyStatsTest(unittest.TestCase):
             collect.upsert_daily_stats(path, vehicle, "t1")
             rows = read_rows(path)
         self.assertEqual([r["date"] for r in rows], ["2026-11-12", "2026-11-13"])
+
+
+class ConnectAndRefreshTest(unittest.TestCase):
+    """Tests for collect.connect_and_refresh token-cache behaviour."""
+
+    CREDENTIALS = {
+        "region": 2, "brand": 1, "username": "u", "password": "p", "pin": "",
+    }
+
+    def make_token(self, refresh_token: str, access_token: str = "access"):
+        """A real Token so the cache round-trip is exercised end to end."""
+        from hyundai_kia_connect_api import Token
+
+        return Token(
+            username="u",
+            password="p",
+            access_token=access_token,
+            refresh_token=refresh_token,
+            valid_until=datetime(2026, 11, 15, tzinfo=timezone.utc),
+        )
+
+    def test_cached_token_is_reused_and_resaved(self):
+        """A valid cache must be handed to the API instead of logging in."""
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "credentials.token.json"
+            cached = self.make_token("old-refresh")
+            kia_common.save_cached_token(cached, token_path)
+            vm = SimpleNamespace(token=cached)
+            with mock.patch.object(
+                kia_common, "connect_vehicle_manager", return_value=vm
+            ) as connect, mock.patch.object(kia_common, "refresh_vehicles"):
+                result = collect.connect_and_refresh(
+                    self.CREDENTIALS, CONFIG, token_path
+                )
+            reloaded = kia_common.load_cached_token(token_path)
+        self.assertIs(result, vm)
+        connect.assert_called_once()
+        self.assertEqual(connect.call_args.kwargs["token"].refresh_token,
+                         "old-refresh")
+        self.assertEqual(reloaded.refresh_token, "old-refresh")
+
+    def test_rejected_cache_falls_back_to_password_login(self):
+        """A stale refresh token must not wedge collection; log in again."""
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "credentials.token.json"
+            kia_common.save_cached_token(self.make_token("stale"), token_path)
+            old_vm = SimpleNamespace(token=self.make_token("stale"))
+            new_token = self.make_token("fresh", access_token="new-access")
+            new_vm = SimpleNamespace(token=new_token)
+            with mock.patch.object(
+                kia_common, "connect_vehicle_manager",
+                side_effect=[old_vm, new_vm],
+            ) as connect, mock.patch.object(
+                kia_common, "refresh_vehicles",
+                side_effect=[RuntimeError("token rejected"), None],
+            ), self.assertLogs(kia_common.logger, level="WARNING"):
+                result = collect.connect_and_refresh(
+                    self.CREDENTIALS, CONFIG, token_path
+                )
+            reloaded = kia_common.load_cached_token(token_path)
+        self.assertIs(result, new_vm)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(reloaded.refresh_token, "fresh")
+
+    def test_cache_write_failure_does_not_fail_collection(self):
+        """An unwritable cache directory only warns; the sample still runs."""
+        cached = self.make_token("refresh")
+        vm = SimpleNamespace(token=cached)
+        with mock.patch.object(
+            kia_common, "connect_vehicle_manager", return_value=vm
+        ), mock.patch.object(
+            kia_common, "refresh_vehicles"
+        ), mock.patch.object(
+            kia_common, "save_cached_token", side_effect=OSError("read-only")
+        ), self.assertLogs(kia_common.logger, level="WARNING"):
+            result = collect.connect_and_refresh(
+                self.CREDENTIALS, CONFIG, Path("/unwritable/token.json")
+            )
+        self.assertIs(result, vm)
+
+
+class MainTokenPersistenceTest(unittest.TestCase):
+    """End-to-end (offline) check that a second collect.py run reuses the token."""
+
+    def test_second_run_uses_cached_token(self):
+        """Run 1 logs in (token=None); run 2 passes the saved token."""
+        from hyundai_kia_connect_api import Token
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "config.toml"
+            config_path.write_text(
+                f'[paths]\ndata_dir = "{tmp_path / "data"}"\n'
+                '[schedule]\ntimezone = "Europe/London"\n',
+                encoding="utf-8",
+            )
+            credentials_path = tmp_path / "credentials.json"
+            credentials_path.write_text(
+                '{"region": 2, "brand": 1, "username": "u", "password": "p"}',
+                encoding="utf-8",
+            )
+            token = Token(
+                username="u", password="p", access_token="a",
+                refresh_token="refresh",
+                valid_until=datetime(2026, 11, 15, tzinfo=timezone.utc),
+            )
+            vehicle = fake_vehicle()
+            vm = SimpleNamespace(token=token, vehicles={"vid": vehicle})
+            seen_tokens = []
+
+            def connect(credentials, token=None):
+                seen_tokens.append(None if token is None else token.refresh_token)
+                return vm
+
+            argv = [
+                "--config", str(config_path),
+                "--credentials", str(credentials_path),
+                "--sample-type", "pre_charge",
+            ]
+            with mock.patch.object(
+                kia_common, "connect_vehicle_manager", side_effect=connect
+            ), mock.patch.object(kia_common, "refresh_vehicles"):
+                self.assertEqual(collect.main(argv), 0)
+                self.assertEqual(collect.main(argv), 0)
+
+            cache = kia_common.load_cached_token(
+                tmp_path / "credentials.token.json"
+            )
+            samples = read_rows(tmp_path / "data" / "samples.csv")
+
+        self.assertEqual(seen_tokens, [None, "refresh"])
+        self.assertEqual(cache.refresh_token, "refresh")
+        self.assertEqual(len(samples), 2)
 
 
 if __name__ == "__main__":

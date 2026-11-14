@@ -17,6 +17,7 @@ folder.
 | `kia_common.py` | Shared helpers (config/credentials loading, API connection, battery-capacity resolution). |
 | `config.toml` | All settings: battery capacity, file paths, sanity thresholds, analysis options. |
 | `credentials.json` | Kia Connect login. **Keep private** (`chmod 600`). Not referenced by any code except via `kia_common.load_credentials`. |
+| `credentials.token.json` | Cached authentication token (automatic, mode 0600). **Keep private**; lets `collect.py` reuse its refresh token instead of logging in on every run. Created next to whichever `--credentials` file is used. |
 | `credentials.example.json` | Template for the credentials file. |
 | `data/samples.csv` | One appended row per `collect.py` run (timestamp, sample type, battery %, odometer, capacity used). |
 | `data/daily.csv` | Per-calendar-day driving stats from the API (distance, kWh used + breakdown), refreshed on every run. |
@@ -285,6 +286,11 @@ heading with `[publish].title` and the table length with
 * The Kia API occasionally fails; `collect.py` retries
   (`[api].retry_count`) and logs errors to stdout (redirected to
   `data/collect.log` by cron).
+* `collect.py` caches its authentication token in
+  `credentials.token.json` (mode 0600, next to the credentials file) and
+  reuses its refresh token on the next run, avoiding a password login
+  twice a day. Delete the file to force a fresh login; a corrupt or
+  rejected cache is replaced automatically.
 
 ## Tests
 

@@ -29,6 +29,12 @@ Two files are written into the data directory (see config.toml [paths]):
 
 analyze.py later combines these files to estimate vehicle range.
 
+The authentication token is cached between runs (by default in
+credentials.token.json, next to the credentials file) so that the twice-daily
+runs reuse its refresh token instead of logging in with the password every
+time.  A corrupt or rejected cache is ignored and the script simply logs in
+again.
+
 Command line interface:
     collect.py [--config FILE] [--credentials FILE]
                [--sample-type {auto,pre_charge,post_charge}]
@@ -41,7 +47,7 @@ import argparse
 import csv
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import kia_common
 from kia_common import logger
@@ -215,6 +221,66 @@ def upsert_daily_stats(path, vehicle, collected_at: str) -> int:
     return len(updates)
 
 
+def connect_and_refresh(credentials: dict, config: dict, token_path):
+    """Connect to the Kia API, reusing and refreshing the cached token.
+
+    Interface: takes the credentials dict, the loaded config dict and the
+    token cache Path.  Loads a cached token when present, asks the API
+    library to refresh its short-lived access token, and saves the updated
+    token back to ``token_path`` for the next run.  If the cached token is
+    rejected (e.g. its refresh token has expired) it falls back to a
+    password login, so a stale cache can never wedge the collector.
+    Returns the refreshed VehicleManager.
+    """
+    retries = int(config["api"]["retry_count"])
+    delay_seconds = float(config["api"]["retry_delay_seconds"])
+
+    cached_token = kia_common.load_cached_token(token_path)
+    if cached_token is not None:
+        print("collect: connect_and_refresh() - no cached token found, logging in with credentials")
+        cached_username = getattr(cached_token, "username", None)
+        if cached_username and cached_username != credentials["username"]:
+            logger.warning(
+                "Cached token belongs to %s, not %s; logging in again",
+                cached_username, credentials["username"],
+            )
+            cached_token = None
+    else:
+        print("collect: connect_and_refresh() - cached token found, attempting to refresh")
+
+    vm = kia_common.connect_vehicle_manager(credentials, token=cached_token)
+    try:
+        kia_common.refresh_vehicles(
+            vm, retries=retries, delay_seconds=delay_seconds
+        )
+    except Exception as error:  # noqa: BLE001 - retry with a fresh login
+        if cached_token is None:
+            raise
+        logger.warning(
+            "Cached authentication token could not be used (%s); "
+            "logging in with the stored credentials",
+            error,
+        )
+        vm = kia_common.connect_vehicle_manager(credentials)
+        kia_common.refresh_vehicles(
+            vm, retries=retries, delay_seconds=delay_seconds
+        )
+
+    # Persist the (possibly refreshed) token.  A read-only directory must
+    # not lose the sample we have already fetched, so save failures only
+    # produce a warning; the next run will just log in again.
+    try:
+        kia_common.save_cached_token(vm.token, token_path)
+        logger.debug("Saved authentication token to %s", token_path)
+    except OSError as error:
+        logger.warning(
+            "Could not save authentication token to %s (%s); "
+            "the next run will log in again",
+            token_path, error,
+        )
+    return vm
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point: fetch vehicle state once and record it to the CSV files.
 
@@ -241,17 +307,14 @@ def main(argv: list[str] | None = None) -> int:
         config = kia_common.load_config(args.config)
         credentials = kia_common.load_credentials(args.credentials)
         paths = kia_common.paths_from_config(config)
-        timezone = kia_common.get_timezone(config)
-        now = datetime.now(timezone)
+        local_timezone = kia_common.get_timezone(config)
+        now = datetime.now(local_timezone)
         sample_type = determine_sample_type(now, config, args.sample_type)
 
-        # Connect to the Kia Connect API and refresh vehicle state.
-        vm = kia_common.connect_vehicle_manager(credentials)
-        kia_common.refresh_vehicles(
-            vm,
-            retries=int(config["api"]["retry_count"]),
-            delay_seconds=float(config["api"]["retry_delay_seconds"]),
-        )
+        # Connect to the Kia Connect API and refresh vehicle state, reusing
+        # the token from the previous run when possible.
+        token_path = kia_common.token_cache_path(args.credentials)
+        vm = connect_and_refresh(credentials, config, token_path)
         vehicle_id, vehicle = kia_common.select_vehicle(
             vm, config["vehicle"]["vin"]
         )

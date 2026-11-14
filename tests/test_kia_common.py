@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -118,6 +119,69 @@ class LoadCredentialsTest(unittest.TestCase):
             path = self.write_creds(tmp, perms=0o644)
             with self.assertLogs(kia_common.logger, level="WARNING"):
                 kia_common.load_credentials(path)
+
+
+class TokenCacheTest(unittest.TestCase):
+    """Tests for kia_common token-cache helpers (save/load/path/permissions)."""
+
+    def make_token(self):
+        """A Token carrying every field the API needs to refresh later."""
+        from hyundai_kia_connect_api import Token
+
+        return Token(
+            username="u",
+            password="p",
+            access_token="access",
+            refresh_token="refresh",
+            device_id="device",
+            valid_until=datetime(2026, 11, 15, 6, 30, tzinfo=timezone.utc),
+        )
+
+    def test_path_is_a_sibling_of_the_credentials_file(self):
+        """A custom credentials path gets its own adjacent token cache."""
+        path = kia_common.token_cache_path("/srv/kia/credentials.json")
+        self.assertEqual(path, Path("/srv/kia/credentials.token.json"))
+
+    def test_round_trip_preserves_fields(self):
+        """Saved tokens load back with the refresh-token fields intact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.token.json"
+            kia_common.save_cached_token(self.make_token(), path)
+            loaded = kia_common.load_cached_token(path)
+        self.assertEqual(loaded.username, "u")
+        self.assertEqual(loaded.access_token, "access")
+        self.assertEqual(loaded.refresh_token, "refresh")
+        self.assertEqual(loaded.valid_until,
+                         datetime(2026, 11, 15, 6, 30, tzinfo=timezone.utc))
+
+    def test_saved_file_is_private(self):
+        """The token is a secret, so the cache must be mode 0600."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.token.json"
+            kia_common.save_cached_token(self.make_token(), path)
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_missing_cache_returns_none(self):
+        """No cache yet is normal on the first run; it must not raise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(
+                kia_common.load_cached_token(Path(tmp) / "missing.token.json")
+            )
+
+    def test_corrupt_cache_warns_and_returns_none(self):
+        """A truncated/corrupt cache falls back to login with a warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.token.json"
+            path.write_text("{not json", encoding="utf-8")
+            with self.assertLogs(kia_common.logger, level="WARNING"):
+                self.assertIsNone(kia_common.load_cached_token(path))
+
+    def test_cannot_save_empty_token(self):
+        """Saving None is a programming error, not a silent no-op."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                kia_common.save_cached_token(None, Path(tmp) / "token.json")
 
 
 class TimezoneTest(unittest.TestCase):
