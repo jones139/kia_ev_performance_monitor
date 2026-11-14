@@ -76,13 +76,13 @@ class ParseEventsTest(unittest.TestCase):
         self.assertEqual(third.location, "Away")
 
     def test_home_vs_away_datetimes(self):
-        """Home charges span overnight; away charges sit mid-day."""
+        """Home charges start on the recorded evening, end next morning."""
         events, _ = imp.parse_charge_events(self.xlsx)
         home, away = events[0], events[2]
         self.assertTrue(home.is_home)
         self.assertFalse(away.is_home)
-        self.assertEqual(home.start_datetime(), datetime(2026, 10, 31, 23, 30))
-        self.assertEqual(home.end_datetime(), datetime(2026, 11, 1, 7, 30))
+        self.assertEqual(home.start_datetime(), datetime(2026, 11, 1, 23, 30))
+        self.assertEqual(home.end_datetime(), datetime(2026, 11, 2, 7, 30))
         self.assertEqual(away.start_datetime(), datetime(2026, 11, 6, 11, 0))
 
     def test_missing_file_raises(self):
@@ -111,8 +111,8 @@ class PeriodsTest(unittest.TestCase):
         self.assertEqual(first.soc_from, 80.0)
         self.assertEqual(first.soc_to, 40.0)
         self.assertAlmostEqual(first.distance_km, 50 * 1.609344, places=1)
-        self.assertEqual(first.days, [date(2026, 11, 1), date(2026, 11, 2)])
-        self.assertEqual(second.days[0], date(2026, 11, 3))
+        self.assertEqual(first.days, [date(2026, 11, 2), date(2026, 11, 3)])
+        self.assertEqual(second.days[0], date(2026, 11, 4))
 
     def test_rising_battery_skips_period(self):
         """A period whose battery rose (unlogged charge) is dropped."""
@@ -193,35 +193,58 @@ class SynthesiseTest(unittest.TestCase):
         events, periods, reg, _ = self.build()
         rows = imp.synthesise_samples(events, periods, {}, reg)
         by_ts = {r["timestamp_local"]: r for r in rows}
-        self.assertEqual(by_ts["2026-11-01T23:59"]["battery_pct"],
-                         by_ts["2026-11-02T00:01"]["battery_pct"])
+        self.assertEqual(by_ts["2026-11-02T23:59"]["battery_pct"],
+                         by_ts["2026-11-03T00:01"]["battery_pct"])
         # anchored rows present: charge end post and charge start pre
-        self.assertEqual(by_ts["2026-11-01T07:30"]["battery_pct"], 80.0)
-        self.assertEqual(by_ts["2026-11-02T23:30"]["battery_pct"], 40.0)
+        self.assertEqual(by_ts["2026-11-02T07:30"]["battery_pct"], 80.0)
+        self.assertEqual(by_ts["2026-11-03T23:30"]["battery_pct"], 40.0)
         # even split (no weights): 40% over 2 days -> 20 per day
-        self.assertEqual(float(by_ts["2026-11-01T23:59"]["battery_pct"]), 60.0)
+        self.assertEqual(float(by_ts["2026-11-02T23:59"]["battery_pct"]), 60.0)
 
     def test_weights_follow_distances(self):
         """With per-day weights the drop follows the distance shares."""
         events, periods, reg, _ = self.build()
-        weights = {date(2026, 11, 1): 30.0, date(2026, 11, 2): 10.0}
+        weights = {date(2026, 11, 2): 30.0, date(2026, 11, 3): 10.0}
         rows = imp.synthesise_samples(events, periods, weights, reg)
         by_ts = {r["timestamp_local"]: r for r in rows}
-        self.assertAlmostEqual(float(by_ts["2026-11-01T23:59"]["battery_pct"]),
+        self.assertAlmostEqual(float(by_ts["2026-11-02T23:59"]["battery_pct"]),
                                80.0 - 40.0 * 0.75, places=6)
 
     def test_daily_only_for_uncovered_dates(self):
         """Derived daily rows skip dates the API already covers."""
         events, periods, _, _ = self.build()
-        rows, overlay = imp.synthesise_daily(periods, {date(2026, 11, 1)},
+        rows, overlay = imp.synthesise_daily(periods, {date(2026, 11, 2)},
                                              {}, "t1")
         dates = {r["date"] for r in rows}
-        self.assertNotIn("2026-11-01", dates)
-        self.assertIn("2026-11-02", dates)
+        self.assertNotIn("2026-11-02", dates)
+        self.assertIn("2026-11-03", dates)
         self.assertTrue(all(r["kwh_used"] == "" for r in rows))
         # overlay covers every period day incl. API-covered ones
         self.assertAlmostEqual(sum(overlay[d] for d in periods[0].days),
                                periods[0].distance_km, places=1)
+
+
+class ReferenceCsvTest(unittest.TestCase):
+    """Tests for imp.write_reference_csv column alignment."""
+
+    def test_period_rows_match_header_columns(self):
+        """Period rows must sit in the same columns as the header."""
+        tmp = Path(tempfile.mkdtemp(prefix="kia_ref_", dir="/tmp/opencode"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        xlsx = tmp / "log.xlsx"
+        make_workbook(xlsx)
+        events, _ = imp.parse_charge_events(xlsx)
+        periods = imp.build_driving_periods(events)
+        path = tmp / "reference.csv"
+        imp.write_reference_csv(path, events, periods)
+        with open(path, newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        period = next(row for row in rows if row["record"] == "period")
+        self.assertEqual(period["days"], "2026-11-02..2026-11-03")
+        self.assertAlmostEqual(float(period["distance_km"]),
+                               50 * 1.609344, places=1)
+        self.assertAlmostEqual(float(period["pct_drop"]), 40.0, places=6)
+        self.assertEqual(period["notes"], "")
 
 
 class MergeTest(unittest.TestCase):

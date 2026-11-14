@@ -106,6 +106,15 @@ class SyntheticPipelineTest(unittest.TestCase):
         self.assertIsNotNone(match, result.stdout)
         self.assertAlmostEqual(float(match.group(1)), TRUE_CAPACITY_KWH, delta=4.0)
 
+    def test_energy_accounting_matches_synthetic_truth(self):
+        """Synthetic kWh equals the %-drop energy, so API/SOC is ~100%."""
+        result = self.analyze()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = re.search(r"Energy accounting: .*API reported [\d.]+ kWh "
+                          r"\((\d+)%\)", result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        self.assertAlmostEqual(float(match.group(1)), 100.0, delta=2.0)
+
     def test_graph_file_created(self):
         """The two-panel PNG must exist and be a real image."""
         result = self.analyze()
@@ -124,6 +133,21 @@ class SyntheticPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(rolling[0], TRUE_RANGE_KM, delta=20.0)
         # method 2 = capacity x efficiency = 50 x 5.0 = 250 km
         self.assertAlmostEqual(rolling[1], 50.0 * EFFICIENCY, delta=10.0)
+
+    def test_miles_output_converts_ranges_and_efficiency(self):
+        """--units miles reports every range/efficiency figure in miles."""
+        result = self.analyze("--units", "miles")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rolling = parse_rolling_values(result.stdout)
+        self.assertEqual(len(rolling), 2)
+        expected = TRUE_RANGE_KM / 1.609344
+        for value in rolling:
+            self.assertAlmostEqual(value, expected, delta=15.0)
+        planning = parse_planning_values(result.stdout)
+        for roll, plan in zip(rolling, planning):
+            self.assertAlmostEqual(plan, roll * PLAN_FACTOR, delta=1.0)
+        self.assertIn("mi/kWh", result.stdout)
+        self.assertNotIn(" km ", result.stdout)
 
     def test_no_data_exits_nonzero(self):
         """An empty data dir must fail with a clear error, not a crash."""

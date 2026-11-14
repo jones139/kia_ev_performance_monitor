@@ -10,6 +10,7 @@ matplotlib's headless Agg backend.
 
 from __future__ import annotations
 
+import copy
 import shutil
 import tempfile
 import unittest
@@ -139,6 +140,36 @@ class BuildDayRecordsTest(unittest.TestCase):
         self.assertFalse(records[date(2026, 11, 3)].pair_measured)
         self.assertEqual(records[date(2026, 11, 4)].capacity_kwh, 71.2)  # filled
 
+    def test_midday_charge_detected_but_duplicate_anchor_ignored(self):
+        """A second charge ending hours later flags the day; a duplicate
+        record of the same overnight charge (minutes apart) must not."""
+        samples_rows = [
+            # 2 Nov: collector + spreadsheet anchor for the same 06:30 end.
+            {"timestamp_local": "2026-11-02T06:30:00+00:00", "date_local": "2026-11-02",
+             "sample_type": "post_charge", "battery_pct": "90"},
+            {"timestamp_local": "2026-11-02T06:45:00+00:00", "date_local": "2026-11-02",
+             "sample_type": "post_charge", "battery_pct": "90"},
+            {"timestamp_local": "2026-11-02T23:45:00+00:00", "date_local": "2026-11-02",
+             "sample_type": "pre_charge", "battery_pct": "80"},
+            # 3 Nov: a real mid-day top-up ends at 12:30.
+            {"timestamp_local": "2026-11-03T06:30:00+00:00", "date_local": "2026-11-03",
+             "sample_type": "post_charge", "battery_pct": "80"},
+            {"timestamp_local": "2026-11-03T11:00:00+00:00", "date_local": "2026-11-03",
+             "sample_type": "pre_charge", "battery_pct": "40"},
+            {"timestamp_local": "2026-11-03T12:30:00+00:00", "date_local": "2026-11-03",
+             "sample_type": "post_charge", "battery_pct": "85"},
+            {"timestamp_local": "2026-11-03T23:45:00+00:00", "date_local": "2026-11-03",
+             "sample_type": "pre_charge", "battery_pct": "70"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "samples.csv"
+            write_samples_csv(path, samples_rows)
+            samples = analyze.load_samples(path)
+        records = {r.date: r for r in
+                   analyze.build_day_records(samples, {}, CONFIG, 71.2)}
+        self.assertFalse(records[date(2026, 11, 2)].charged_during_day)
+        self.assertTrue(records[date(2026, 11, 3)].charged_during_day)
+
 
 class EstimateSeriesTest(unittest.TestCase):
     """Tests for analyze.estimate_series thresholds and skip reasons."""
@@ -199,6 +230,28 @@ class EstimateSeriesTest(unittest.TestCase):
         self.assertEqual(len(self.series["distance"]), 6)
         self.assertEqual(len(self.series["kwh"]), 6)
 
+    def test_flagged_midday_charge_drops_method1_only(self):
+        """A flagged top-up invalidates the % estimate, not the kWh one."""
+        records = [record(0, pct_start=90.0, pct_end=80.0, distance_km=50.0,
+                          kwh_used=10.0, capacity_kwh=71.2,
+                          charged_during_day=True)]
+        series, skipped = analyze.estimate_series(records, CONFIG)
+        self.assertEqual(series["range_pct"], [])
+        self.assertEqual(series["range_kwh"], [(D1, 71.2 * 50.0 / 10.0)])
+        self.assertEqual(skipped["charged_during_day"], 1)
+
+    def test_kwh_correction_scales_method2_only(self):
+        """kwh_correction divides method 2's energy, leaving method 1 alone."""
+        records = [record(0, pct_start=90.0, pct_end=80.0, distance_km=50.0,
+                          kwh_used=10.0, capacity_kwh=71.2)]
+        plain, _ = analyze.estimate_series(records, CONFIG)
+        corrected, _ = analyze.estimate_series(records, CONFIG, 1.25)
+        self.assertEqual(plain["range_pct"], corrected["range_pct"])
+        self.assertAlmostEqual(
+            dict(corrected["range_kwh"])[D1],
+            dict(plain["range_kwh"])[D1] / 1.25, places=6,
+        )
+
 
 class RollingAverageTest(unittest.TestCase):
     """Tests for analyze.rolling_average windowing rules."""
@@ -230,6 +283,156 @@ class ScaleSeriesTest(unittest.TestCase):
         """Dates are preserved; values multiplied by the factor."""
         scaled = analyze.scale_series([(D1, 100.0), (D1, 50.0)], 0.8)
         self.assertEqual(scaled, [(D1, 80.0), (D1, 40.0)])
+
+
+class EnergyAccountingTest(unittest.TestCase):
+    """Tests for analyze.energy_accounting SOC-vs-API energy comparison."""
+
+    def test_sums_only_days_with_both_quantities(self):
+        """Battery energy uses the % drop x capacity; API energy is summed."""
+        records = [
+            record(0, pct_start=90.0, pct_end=70.0, kwh_used=10.0,
+                   distance_km=100.0, capacity_kwh=71.2),
+            record(1, pct_start=80.0, pct_end=60.0, kwh_used=12.0,
+                   distance_km=200.0, capacity_kwh=71.2),
+            record(2, pct_start=60.0, pct_end=60.0, kwh_used=1.0,
+                   distance_km=5.0, capacity_kwh=71.2),  # zero drop: excluded
+            record(3, pct_start=70.0, pct_end=None, kwh_used=5.0,
+                   distance_km=5.0, capacity_kwh=71.2),  # missing %: excluded
+            record(4, pct_start=50.0, pct_end=40.0, kwh_used=None,
+                   distance_km=5.0, capacity_kwh=71.2),  # missing kWh: excluded
+        ]
+        result = analyze.energy_accounting(records)
+        self.assertEqual(result["days"], 2)
+        self.assertAlmostEqual(result["soc_kwh"], 0.40 * 71.2, places=6)
+        self.assertAlmostEqual(result["api_kwh"], 22.0, places=6)
+        self.assertAlmostEqual(result["ratio"], 22.0 / 28.48, places=6)
+        self.assertAlmostEqual(result["gap_kwh"], 28.48 - 22.0, places=6)
+        self.assertAlmostEqual(result["gap_per_day"], (28.48 - 22.0) / 2,
+                               places=6)
+        self.assertAlmostEqual(result["distance_km"], 300.0, places=6)
+        self.assertAlmostEqual(result["gap_per_100km"],
+                               (28.48 - 22.0) / 300.0 * 100.0, places=6)
+
+    def test_missing_data_returns_none(self):
+        """No qualifying days -> ratio/gap figures are None."""
+        result = analyze.energy_accounting([])
+        self.assertEqual(result["days"], 0)
+        self.assertIsNone(result["ratio"])
+        self.assertIsNone(result["gap_per_day"])
+        self.assertIsNone(result["gap_per_100km"])
+
+    def test_midday_charge_days_are_excluded(self):
+        """A top-up day has an understated drop and must not bias the ratio."""
+        records = [
+            record(0, pct_start=90.0, pct_end=70.0, kwh_used=10.0,
+                   distance_km=50.0, capacity_kwh=71.2),
+            record(1, pct_start=90.0, pct_end=85.0, kwh_used=10.0,
+                   distance_km=50.0, capacity_kwh=71.2,
+                   charged_during_day=True),   # would halve the apparent ratio
+        ]
+        result = analyze.energy_accounting(records)
+        self.assertEqual(result["days"], 1)
+        self.assertAlmostEqual(result["soc_kwh"], 0.20 * 71.2, places=6)
+        self.assertAlmostEqual(result["api_kwh"], 10.0, places=6)
+
+
+class ResolveKwhCorrectionTest(unittest.TestCase):
+    """Tests for analyze.resolve_kwh_correction."""
+
+    @staticmethod
+    def _records(count: int, ratio: float) -> list[analyze.DayRecord]:
+        """Records with a 10% drop (7.12 kWh) and API kWh set to ``ratio``."""
+        return [
+            record(index, pct_start=100.0, pct_end=90.0,
+                   kwh_used=7.12 * ratio, distance_km=50.0,
+                   capacity_kwh=71.2)
+            for index in range(count)
+        ]
+
+    def test_auto_uses_inverse_of_energy_ratio(self):
+        """With enough days, auto returns 1 / (api/soc) and explains it."""
+        factor, note = analyze.resolve_kwh_correction(
+            CONFIG, self._records(12, 0.80)
+        )
+        self.assertAlmostEqual(factor, 1.25, places=6)
+        self.assertIn("80%", note)
+        self.assertIn("12 day", note)
+
+    def test_auto_needs_enough_days(self):
+        """Too few qualifying days -> no correction."""
+        factor, note = analyze.resolve_kwh_correction(
+            CONFIG, self._records(3, 0.80)
+        )
+        self.assertEqual(factor, 1.0)
+        self.assertIn("using 1.00", note)
+
+    def test_auto_ignores_ratio_above_one(self):
+        """If the API matches or exceeds SOC energy, no correction is made."""
+        factor, _ = analyze.resolve_kwh_correction(
+            CONFIG, self._records(12, 1.02)
+        )
+        self.assertEqual(factor, 1.0)
+
+    def test_explicit_number_wins_and_clamps(self):
+        """A configured factor is used directly, clamped to [1.0, 2.0]."""
+        config = copy.deepcopy(CONFIG)
+        config["analysis"]["api_energy_correction"] = 1.3
+        self.assertAlmostEqual(
+            analyze.resolve_kwh_correction(config, self._records(1, 1.0))[0],
+            1.3, places=6,
+        )
+        config["analysis"]["api_energy_correction"] = 0.7
+        self.assertEqual(
+            analyze.resolve_kwh_correction(config, [])[0], 1.0
+        )
+        config["analysis"]["api_energy_correction"] = 9.0
+        self.assertEqual(
+            analyze.resolve_kwh_correction(config, [])[0], 2.0
+        )
+
+    def test_invalid_setting_falls_back(self):
+        """A non-numeric string logs and falls back to 1.0."""
+        config = copy.deepcopy(CONFIG)
+        config["analysis"]["api_energy_correction"] = "banana"
+        factor, note = analyze.resolve_kwh_correction(config, [])
+        self.assertEqual(factor, 1.0)
+        self.assertIn("invalid", note)
+
+
+class OutputUnitsTest(unittest.TestCase):
+    """Tests for analyze.output_units reporting-unit resolution."""
+
+    def config_with_units(self, value):
+        """Defaults merged with one [analysis].output_units value."""
+        return kia_common._deep_merge(kia_common.DEFAULTS,
+                                      {"analysis": {"output_units": value}})
+
+    def test_default_is_km(self):
+        """Built-in defaults report in km with factor 1."""
+        self.assertEqual(analyze.output_units(kia_common._deep_merge(
+            kia_common.DEFAULTS, {})), ("km", 1.0))
+
+    def test_miles_config_and_spellings(self):
+        """"miles"/"mi" both select the 1/1.609344 conversion."""
+        for spelling in ("miles", "mi", "MILES"):
+            label, factor = analyze.output_units(
+                self.config_with_units(spelling))
+            self.assertEqual(label, "mi")
+            self.assertAlmostEqual(factor, 1 / 1.609344, places=9)
+
+    def test_cli_override_wins(self):
+        """An override string beats the configured value."""
+        self.assertEqual(
+            analyze.output_units(self.config_with_units("km"), "miles")[0],
+            "mi")
+
+    def test_unknown_value_warns_and_falls_back(self):
+        """A nonsense unit logs a warning and reports km."""
+        with self.assertLogs(analyze.logger, level="WARNING"):
+            label, factor = analyze.output_units(
+                self.config_with_units("furlongs"))
+        self.assertEqual((label, factor), ("km", 1.0))
 
 
 class MakeGraphTest(unittest.TestCase):

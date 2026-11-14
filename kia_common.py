@@ -69,8 +69,20 @@ DEFAULTS: dict = {
         "retry_count": 2,
         "retry_delay_seconds": 30,
     },
+    "publish": {
+        "output_dir": "publish",
+        "title": "Kia EV range report",
+        "recent_days": 14,
+    },
     "analysis": {
         "rolling_window_days": 7,
+        "output_units": "km",
+        # Method 2 scales the API's kWh by this factor before computing
+        # range.  "auto" derives it from the energy accounting (the API's
+        # daily kWh are consistently lower than the battery energy implied
+        # by the % drop, because the car meters motor-side energy and omits
+        # drivetrain losses).  A number >= 1 forces a fixed factor.
+        "api_energy_correction": "auto",
         "plan_max_pct": 100,
         "plan_min_pct": 20,
         "min_pct_delta": 2,

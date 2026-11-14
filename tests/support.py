@@ -187,11 +187,16 @@ def run_analyze(data_dir: Path, output: Path,
     the output PNG path and any extra CLI arguments (e.g.
     ["--capacity-kwh", "50"]).  Runs with the same interpreter executing
     the tests; returns the CompletedProcess (stdout/stderr captured).
+
+    Reporting units are pinned to km so assertions do not depend on the
+    user's [analysis].output_units preference; extras are appended after
+    the pin, so an explicit ``--units miles`` in ``extra_args`` still wins.
     """
     command = [
         sys.executable, str(REPO_ROOT / "analyze.py"),
         "--data-dir", str(data_dir),
         "--output", str(output),
+        "--units", "km",
         *(extra_args or []),
     ]
     return subprocess.run(command, capture_output=True, text=True,
@@ -202,19 +207,40 @@ def parse_rolling_values(stdout: str) -> list[float]:
     """Extract the rolling-average range values from an analyze.py summary.
 
     Interface: takes the summary text printed by analyze.py and returns the
-    rolling-average km values in order of appearance (method 1 first, then
-    method 2).  Methods with no estimates contribute nothing.
+    rolling-average range values (in whatever units the run reported) in
+    order of appearance (method 1 first, then method 2).  Methods with no
+    estimates contribute nothing.
     """
     return [float(value) for value in
-            re.findall(r"rolling avg\s*:\s*([\d.]+)\s*km", stdout)]
+            re.findall(r"rolling avg\s*:\s*([\d.]+)\s*(?:km|mi)\b", stdout)]
 
 
 def parse_planning_values(stdout: str) -> list[float]:
     """Extract the planning-range values from an analyze.py summary.
 
     Interface: takes the summary text printed by analyze.py and returns the
-    planning-range km values in order of appearance (method 1 first, then
-    method 2).  Methods with no estimates contribute nothing.
+    planning-range values (in whatever units the run reported) in order of
+    appearance (method 1 first, then method 2).  Methods with no estimates
+    contribute nothing.
     """
     return [float(value) for value in
-            re.findall(r"planning range\s*:\s*([\d.]+)\s*km", stdout)]
+            re.findall(r"planning range\s*:\s*([\d.]+)\s*(?:km|mi)\b", stdout)]
+
+
+def run_publish(config_path: Path,
+                extra_args: list[str] | None = None) -> subprocess.CompletedProcess:
+    """Run publish.py as a subprocess against a temporary config file.
+
+    Interface: takes the config.toml path (normally written into a temp
+    directory and pointing [paths].data_dir / [publish].output_dir at that
+    directory) and any extra CLI arguments (e.g. ["--units", "miles"]).
+    Runs with the same interpreter executing the tests; returns the
+    CompletedProcess (stdout/stderr captured).
+    """
+    command = [
+        sys.executable, str(REPO_ROOT / "publish.py"),
+        "--config", str(config_path),
+        *(extra_args or []),
+    ]
+    return subprocess.run(command, capture_output=True, text=True,
+                          cwd=str(REPO_ROOT))

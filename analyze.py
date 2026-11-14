@@ -5,7 +5,10 @@ Reads the CSV files written by collect.py (data/samples.csv and
 data/daily.csv) and produces:
 
   * a printed summary: latest spot estimates, rolling averages, planning
-    ranges, period totals and an "implied battery capacity" diagnostic
+    ranges, period totals, an "implied battery capacity" diagnostic, and an
+    energy-accounting check comparing the API's daily kWh with the battery
+    energy implied by the battery-% drop (a ratio below 1 means the API
+    under-reports consumption and method 2 reads high)
   * a PNG graph with two panels, one per estimation method:
 
       Method 1 (battery % change):  each day, the drop in battery % between
@@ -16,7 +19,11 @@ data/daily.csv) and produces:
       Method 2 (kWh used):  the vehicle-reported energy use for the day is
           compared with the distance driven, and scaled by the usable
           battery capacity (from config.toml / the API, see kia_common):
-              full range (km) = distance / kwh_used * capacity_kwh
+              full range (km) = distance / (kwh_used * correction) * capacity_kwh
+          ``correction`` is [analysis].api_energy_correction ("auto" by
+          default): the car's energy meter reports motor-side energy and
+          omits drivetrain losses, so its kWh explain only ~79% of the
+          battery energy implied by the % drop (see energy_accounting).
 
     Each panel shows the daily spot estimate, a rolling average over the
     previous N days (default 7), and a "planning range" line: the rolling
@@ -32,7 +39,7 @@ when the car was charged during the day.
 Command line interface:
     analyze.py [--config FILE] [--data-dir DIR] [--samples FILE]
                [--daily FILE] [--output FILE.png] [--window DAYS]
-               [--capacity-kwh KWH] [--show]
+               [--capacity-kwh KWH] [--units {km,miles}] [--show]
 """
 
 from __future__ import annotations
@@ -54,6 +61,12 @@ COLOR_SPOT = "#9aa5b1"      # daily spot estimates (thin, grey-blue)
 COLOR_ROLLING = "#1f77b4"   # rolling average (solid blue)
 COLOR_PLANNING = "#e67e22"  # planning range (dashed orange)
 
+# A charge ending more than this long after the morning sample counts as a
+# mid-day top-up.  Duplicate records of the SAME overnight charge (the
+# collector and the spreadsheet import both anchor it) differ by minutes,
+# so they must not be mistaken for a second charge.
+MIDDAY_CHARGE_GAP = timedelta(hours=2)
+
 
 @dataclass
 class DayRecord:
@@ -64,6 +77,9 @@ class DayRecord:
     day (None when missing); ``pair_measured`` is True when both bounding
     samples are real anchors (source not "manual_derived"), i.e. the %
     drop was measured rather than apportioned from a charge period;
+    ``charged_during_day`` is True when the car charged again between the
+    morning and evening samples, which makes that day's % drop an
+    understatement of consumption (the top-up refilled part of it);
     ``distance_km`` / ``kwh_used`` are the API's per-day driving stats
     (None when the day is absent from daily.csv); ``distance_range_km``
     is the spreadsheet import's period-consistent distance share for the
@@ -77,6 +93,7 @@ class DayRecord:
     pct_start: float | None = None
     pct_end: float | None = None
     pair_measured: bool = False
+    charged_during_day: bool = False
     distance_km: float | None = None
     distance_range_km: float | None = None
     kwh_used: float | None = None
@@ -228,11 +245,20 @@ def build_day_records(
         pair_measured = bool(morning and evening) and all(
             s["source"] != "manual_derived" for s in (morning[0], evening[-1])
         )
+        # A second charge ENDING well after the morning sample means the
+        # car was topped up during the day: the morning/evening % pair no
+        # longer measures that day's consumption.
+        charged_during_day = bool(morning_ts) and any(
+            sample["sample_type"] == "post_charge"
+            and sample["ts"] - morning_ts > MIDDAY_CHARGE_GAP
+            for sample in day_samples
+        )
         records.append(DayRecord(
             date=day,
             pct_start=pct_start,
             pct_end=evening[-1]["battery_pct"] if evening else None,
             pair_measured=pair_measured,
+            charged_during_day=charged_during_day,
             distance_km=stats.get("distance_km"),
             distance_range_km=stats.get("distance_range_km"),
             kwh_used=stats.get("kwh_used"),
@@ -242,12 +268,14 @@ def build_day_records(
 
 
 def estimate_series(
-    records: list[DayRecord], config: dict
+    records: list[DayRecord], config: dict, kwh_correction: float = 1.0
 ) -> tuple[dict[str, list[tuple[date, float]]], dict[str, int]]:
     """Compute the daily range estimates for both methods.
 
-    Interface: takes the DayRecords (build_day_records) and the config
-    dict.  Returns (series, skipped) where ``series`` maps names to sorted
+    Interface: takes the DayRecords (build_day_records), the config dict
+    and ``kwh_correction``, the factor applied to the API's reported kWh
+    before method 2 (1.0 = raw API values; see resolve_kwh_correction).
+    Returns (series, skipped) where ``series`` maps names to sorted
     lists of (date, value):
         "range_pct"        - full-charge range (km) from battery-% change
         "range_kwh"        - full-charge range (km) from kWh used x capacity
@@ -287,6 +315,11 @@ def estimate_series(
         pct_delta = None
         if record.pct_start is not None and record.pct_end is not None:
             pct_delta = record.pct_start - record.pct_end
+            if record.charged_during_day:
+                # A mid-day top-up refilled part of the drop, so the %-based
+                # estimate would read far too high; method 2 is unaffected.
+                skipped["charged_during_day"] += 1
+                pct_delta = None
         elif record.distance_km is not None:
             # A driving day with no morning/evening sample pair: the
             # %-based method cannot be applied.
@@ -317,17 +350,20 @@ def estimate_series(
                 else:
                     skipped["implausible_estimate"] += 1
 
-        # Method 2: reported kWh used x battery capacity.
-        if (distance_ok and record.kwh_used is not None
-                and record.kwh_used >= min_kwh
+        # Method 2: reported kWh used x battery capacity.  The API's kWh are
+        # scaled by kwh_correction first (the car's energy meter omits
+        # drivetrain losses; see resolve_kwh_correction).
+        kwh = (record.kwh_used * kwh_correction
+               if record.kwh_used is not None else None)
+        if (distance_ok and kwh is not None and kwh >= min_kwh
                 and record.capacity_kwh):
-            value = record.capacity_kwh * record.distance_km / record.kwh_used
+            value = record.capacity_kwh * record.distance_km / kwh
             if band_lo <= value <= band_hi:
                 series["range_kwh"].append((record.date, value))
                 accepted_kwh = True
             else:
                 skipped["implausible_estimate"] += 1
-        elif distance_ok and record.kwh_used is not None:
+        elif distance_ok and kwh is not None:
             skipped["usage_too_small"] += 1
 
         # Diagnostic: usable capacity implied by the day's own data, only
@@ -337,10 +373,119 @@ def estimate_series(
         if (accepted_pct and accepted_kwh and record.pair_measured
                 and pct_delta >= min_pct_capacity):
             series["implied_capacity"].append(
-                (record.date, record.kwh_used / (pct_delta / 100.0))
+                (record.date, kwh / (pct_delta / 100.0))
             )
 
     return series, skipped
+
+
+def energy_accounting(records: list[DayRecord]) -> dict:
+    """Compare API-reported energy use with battery energy from the % drop.
+
+    Interface: takes the DayRecords.  Over every day that has BOTH a
+    positive battery-% drop and API kWh data, sums the battery energy
+    implied by the drop (pct_delta / 100 x that day's capacity) and the
+    energy the API reported.  Returns a dict with:
+        "days"        - number of days included
+        "soc_kwh"     - battery energy implied by the % drops (kWh)
+        "api_kwh"     - energy reported by the API (kWh)
+        "ratio"       - api_kwh / soc_kwh, or None when unavailable
+        "gap_kwh"     - soc_kwh - api_kwh (unaccounted energy, kWh)
+        "gap_per_day" - gap_kwh / days, or None when there are no days
+        "distance_km" - distance driven over the included days (km)
+        "gap_per_100km" - gap_kwh per 100 km, or None when no distance
+    Days are excluded when the car charged during the day (the resulting
+    % drop understates consumption, which would bias the ratio upwards),
+    when the drop is zero/negative, and when either quantity is missing.
+    Individual days can be misleading when the % drop was apportioned
+    across a charge period, but sums over consecutive days reproduce the
+    measured period totals, so the aggregate ratio is meaningful.  A ratio
+    below 1 means the API's daily stats under-report the energy that
+    actually left the battery, which makes method 2's range estimate
+    optimistic.  Comparing gap_per_day with gap_per_100km shows whether
+    the missing energy is time-based (parked/standby) or distance-based
+    (used while driving): measured data show a stable per-100 km gap and
+    no per-day component, i.e. a metering shortfall proportional to
+    traction energy (drivetrain losses), not a parked drain.
+    """
+    days = [
+        record for record in records
+        if (record.kwh_used is not None and record.capacity_kwh
+            and not record.charged_during_day
+            and record.pct_start is not None and record.pct_end is not None
+            and record.pct_start > record.pct_end)
+    ]
+    soc_kwh = sum((record.pct_start - record.pct_end) / 100.0
+                  * record.capacity_kwh for record in days)
+    api_kwh = sum(record.kwh_used for record in days)
+    distance_km = sum(record.distance_km or 0.0 for record in days)
+    ratio = api_kwh / soc_kwh if soc_kwh > 0 else None
+    gap = soc_kwh - api_kwh
+    return {
+        "days": len(days),
+        "soc_kwh": soc_kwh,
+        "api_kwh": api_kwh,
+        "ratio": ratio,
+        "gap_kwh": gap,
+        "gap_per_day": gap / len(days) if days else None,
+        "distance_km": distance_km,
+        "gap_per_100km": gap / distance_km * 100.0 if distance_km else None,
+    }
+
+
+def resolve_kwh_correction(
+    config: dict, records: list[DayRecord]
+) -> tuple[float, str]:
+    """Resolve the factor applied to the API's kWh inside method 2.
+
+    Interface: takes the config dict and the DayRecords.  Returns
+    (factor, note) where ``factor`` is >= 1.0 and ``note`` is a short
+    human-readable explanation for the summary/page.
+
+    [analysis].api_energy_correction may be "auto" (default) or a number.
+    "auto" derives the factor from energy_accounting(): the API's daily
+    kWh are consistently a fraction of the battery energy implied by the
+    % drop because the car meters motor-side energy and omits drivetrain
+    losses, so factor = 1 / ratio.  It needs at least 10 qualifying days
+    and a plausible ratio (0.5-0.98); otherwise 1.0 is used and the note
+    says so.  A configured number is used as-is (clamped to 1.0-2.0).
+    The factor never shrinks range: values below 1.0 are clamped to 1.0.
+    """
+    setting = config["analysis"].get("api_energy_correction", "auto")
+    if isinstance(setting, str):
+        text = setting.strip().lower()
+        if text in ("", "auto"):
+            energy = energy_accounting(records)
+            ratio = energy["ratio"]
+            if energy["days"] >= 10 and ratio and 0.5 <= ratio < 0.98:
+                return min(1.0 / ratio, 2.0), (
+                    f"auto: API reports {ratio:.0%} of battery energy over "
+                    f"{energy['days']} day(s)"
+                )
+            return 1.0, (
+                f"auto: only {energy['days']} usable day(s); using 1.00"
+            )
+        try:
+            setting = float(text)
+        except ValueError:
+            logger.warning(
+                "Invalid [analysis].api_energy_correction %r; using 1.0",
+                text,
+            )
+            return 1.0, "invalid setting; using 1.00"
+    try:
+        factor = float(setting)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid [analysis].api_energy_correction %r; using 1.0", setting
+        )
+        return 1.0, "invalid setting; using 1.00"
+    clamped = min(max(factor, 1.0), 2.0)
+    if clamped != factor:
+        logger.warning(
+            "api_energy_correction %.2f clamped to %.2f", factor, clamped
+        )
+    return clamped, "configured in config.toml"
 
 
 def rolling_average(
@@ -381,6 +526,25 @@ def scale_series(
     return [(day, value * factor) for day, value in series]
 
 
+def output_units(config: dict, override: str | None = None) -> tuple[str, float]:
+    """Resolve the reporting units for the summary and graph.
+
+    Interface: takes the config dict and an optional CLI override string;
+    returns (unit_label, km_to_unit_factor) where unit_label is "km" or
+    "mi" and the factor converts internally-stored km values into the
+    reporting unit ("miles"/"mi" -> 1/1.609344).  Unknown values log a
+    warning and fall back to km.  All stored data, sanity thresholds and
+    the plausibility band remain km regardless of this setting.
+    """
+    raw = str(override or config["analysis"].get("output_units", "km"))
+    raw = raw.strip().lower()
+    if raw in ("miles", "mile", "mi"):
+        return "mi", 1.0 / kia_common.MILES_TO_KM
+    if raw not in ("km", "kilometres", "kilometers"):
+        logger.warning("Unknown output units %r; reporting in km", raw)
+    return "km", 1.0
+
+
 def make_graph(
     output_path: Path,
     panels: list[tuple[str, list, list, list]],
@@ -389,16 +553,18 @@ def make_graph(
     plan_min_pct: float,
     vehicle_name: str,
     show: bool = False,
+    unit_label: str = "km",
 ) -> None:
     """Render the two-panel range graph and save it as a PNG file.
 
     Interface: takes the output Path, a list of panels where each panel is
     (title, spot_series, rolling_series, planning_series) of (date, value)
     tuples, the rolling window size and planning SOC limits (for legend
-    labels), the vehicle name (figure title) and ``show`` to also display
-    the figure interactively (requires a desktop session).  Uses the
-    non-interactive Agg backend unless ``show`` is set, so it is safe to
-    run headless on a server.
+    labels), the vehicle name (figure title), ``show`` to also display
+    the figure interactively (requires a desktop session) and
+    ``unit_label`` ("km"/"mi") for the y-axis labels; the series values
+    must already be in that unit.  Uses the non-interactive Agg backend
+    unless ``show`` is set, so it is safe to run headless on a server.
     """
     import matplotlib
 
@@ -436,7 +602,7 @@ def make_graph(
                     fontsize=11, color="#666666")
             ax.set_yticks([])
         ax.set_title(title, fontsize=11)
-        ax.set_ylabel("Estimated range (km)")
+        ax.set_ylabel(f"Estimated range ({unit_label})")
         ax.grid(True, alpha=0.3)
     axes[-1].set_xlabel("Date")
     fig.suptitle(
@@ -460,15 +626,24 @@ def print_summary(
     rolling_kwh: list[tuple[date, float]],
     window_days: int,
     plan_factor: float,
+    unit_label: str = "km",
+    unit_factor: float = 1.0,
+    kwh_correction: float = 1.0,
+    correction_note: str = "",
 ) -> None:
     """Print a text summary of the range analysis to stdout.
 
     Interface: takes the day records, the estimate series (estimate_series),
-    the skipped-day counters, the two rolling-average series and the
-    planning factor.  Prints: data period, per-method latest spot value /
-    rolling average / planning range, period and recent-window totals,
-    average efficiency, the implied-capacity diagnostic and rejected-day
-    counts.  Returns None.
+    the skipped-day counters, the two rolling-average series, the planning
+    factor and the reporting units (``unit_label`` plus ``unit_factor``
+    converting the internally-stored km values).  ``kwh_correction`` and
+    ``correction_note`` describe the factor already applied to method 2's
+    kWh (resolve_kwh_correction).  Range series passed in must already be
+    in the reporting unit; distances taken from records are converted
+    here.  Prints: data period, the method-2 correction, per-method latest
+    spot value / rolling average / planning range, period and
+    recent-window totals, average efficiency, the implied-capacity
+    diagnostic and rejected-day counts.  Returns None.
     """
     driving_days = [r for r in records if r.distance_km is not None]
     line = "-" * 62
@@ -488,38 +663,46 @@ def print_summary(
             return
         spot_date, spot_value = spot[-1]
         print(f"{name}:")
-        print(f"  latest daily estimate : {spot_value:7.0f} km  ({spot_date})")
+        print(f"  latest daily estimate : {spot_value:7.0f} {unit_label}"
+              f"  ({spot_date})")
         if rolling:
             roll_value = rolling[-1][0], rolling[-1][1]
-            print(f"  {window_days}-day rolling avg : {roll_value[1]:7.0f} km"
-                  f"  ({roll_value[0]})")
-            print(f"  planning range        : {roll_value[1] * plan_factor:7.0f} km"
-                  f"  (rolling avg x {plan_factor:.2f})")
+            print(f"  {window_days}-day rolling avg : {roll_value[1]:7.0f} "
+                  f"{unit_label}  ({roll_value[0]})")
+            print(f"  planning range        : {roll_value[1] * plan_factor:7.0f} "
+                  f"{unit_label}  (rolling avg x {plan_factor:.2f})")
 
+    correction = f"x{kwh_correction:.2f}"
+    if correction_note:
+        correction += f" ({correction_note})"
+    print(f"Method 2 energy correction: {correction}")
     describe("Method 1 (battery % change)", series["range_pct"], rolling_pct)
     describe("Method 2 (kWh used x capacity)", series["range_kwh"], rolling_kwh)
 
     # Period and recent-window totals.  Efficiency is computed only over
     # days that have BOTH distance and kWh (manual_derived rows carry
-    # distance only), so the km/kWh figures stay meaningful.
+    # distance only), so the distance/kWh figures stay meaningful.
     both_days = [r for r in driving_days if r.kwh_used is not None]
-    total_km = sum(r.distance_km for r in driving_days)
+    total_dist = sum(r.distance_km for r in driving_days) * unit_factor
     total_kwh = sum(r.kwh_used or 0.0 for r in driving_days)
     if both_days:
-        eff_km = sum(r.distance_km for r in both_days)
+        eff_dist = sum(r.distance_km for r in both_days) * unit_factor
         eff_kwh = sum(r.kwh_used for r in both_days)
-        print(f"Total: {total_km:.0f} km over {len(driving_days)} day(s); "
+        print(f"Total: {total_dist:.0f} {unit_label} over "
+              f"{len(driving_days)} day(s); "
               f"{eff_kwh:.1f} kWh over the {len(both_days)} day(s) with "
-              f"energy data -> average {eff_km / eff_kwh:.2f} km/kWh")
+              f"energy data -> average {eff_dist / eff_kwh:.2f} "
+              f"{unit_label}/kWh")
     cutoff = max((r.date for r in driving_days), default=None)
     if cutoff:
         recent = [r for r in both_days
                   if r.date > cutoff - timedelta(days=window_days)]
-        recent_km = sum(r.distance_km for r in recent)
+        recent_dist = sum(r.distance_km for r in recent) * unit_factor
         recent_kwh = sum(r.kwh_used or 0.0 for r in recent)
         if recent_kwh > 0:
-            print(f"Last {window_days} days: {recent_km:.0f} km using "
-                  f"{recent_kwh:.1f} kWh -> {recent_km / recent_kwh:.2f} km/kWh")
+            print(f"Last {window_days} days: {recent_dist:.0f} {unit_label} "
+                  f"using {recent_kwh:.1f} kWh -> "
+                  f"{recent_dist / recent_kwh:.2f} {unit_label}/kWh")
 
     # Implied battery capacity diagnostic.
     implied = [value for _, value in series["implied_capacity"]]
@@ -528,6 +711,19 @@ def print_summary(
               f"{statistics.median(implied):.1f} kWh from {len(implied)} day(s) "
               f"(min {min(implied):.1f}, max {max(implied):.1f}) - compare "
               f"with [battery].capacity_kwh in config.toml")
+
+    # Energy accounting: does the API's daily kWh explain the battery's
+    # actual depletion?  A ratio below 1 means method 2 reads high.
+    energy = energy_accounting(records)
+    if energy["days"] >= 3 and energy["ratio"] is not None:
+        print(f"Energy accounting: over {energy['days']} day(s) with both "
+              f"battery-% and kWh data, the battery used "
+              f"{energy['soc_kwh']:.1f} kWh but the API reported "
+              f"{energy['api_kwh']:.1f} kWh ({energy['ratio']:.0%}); "
+              f"{energy['gap_kwh']:.1f} kWh unaccounted "
+              f"({energy['gap_per_day']:.1f} kWh/day, "
+              f"{energy['gap_per_100km']:.1f} kWh/100km) -> raw method 2 "
+              f"over-reads by ~{1 / energy['ratio'] - 1:.0%}")
 
     rejected = {reason: count for reason, count in skipped.items() if count}
     if rejected:
@@ -556,6 +752,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="rolling-average window in days (default: config)")
     parser.add_argument("--capacity-kwh", type=float,
                         help="override the battery capacity used by method 2")
+    parser.add_argument("--units", choices=("km", "miles"),
+                        help="override [analysis].output_units for this run")
     parser.add_argument("--show", action="store_true",
                         help="also display the graph (needs a desktop session)")
     args = parser.parse_args(argv)
@@ -603,7 +801,8 @@ def main(argv: list[str] | None = None) -> int:
         # rescale the whole history rather than only sample-less days.
         for record in records:
             record.capacity_kwh = args.capacity_kwh
-    series, skipped = estimate_series(records, config)
+    kwh_correction, correction_note = resolve_kwh_correction(config, records)
+    series, skipped = estimate_series(records, config, kwh_correction)
     if not series["range_pct"] and not series["range_kwh"]:
         logger.error(
             "Not enough data yet to estimate range. Method 1 needs morning "
@@ -617,6 +816,17 @@ def main(argv: list[str] | None = None) -> int:
     planning_pct = scale_series(rolling_pct, plan_factor)
     planning_kwh = scale_series(rolling_kwh, plan_factor)
 
+    # Convert the finished range estimates (and everything derived from
+    # them) from the internal km representation into the reporting units.
+    unit_label, unit_factor = output_units(config, args.units)
+    if unit_factor != 1.0:
+        series["range_pct"] = scale_series(series["range_pct"], unit_factor)
+        series["range_kwh"] = scale_series(series["range_kwh"], unit_factor)
+        rolling_pct = scale_series(rolling_pct, unit_factor)
+        rolling_kwh = scale_series(rolling_kwh, unit_factor)
+        planning_pct = scale_series(planning_pct, unit_factor)
+        planning_kwh = scale_series(planning_kwh, unit_factor)
+
     vehicle_name = next(
         (s["vehicle_name"] for s in samples if s["vehicle_name"]), "Kia EV"
     )
@@ -626,7 +836,9 @@ def main(argv: list[str] | None = None) -> int:
             ("Method 1: battery % change vs distance driven",
              series["range_pct"], rolling_pct, planning_pct),
             ("Method 2: reported kWh used x battery capacity "
-             f"(default: {capacity_desc})",
+             f"(default: {capacity_desc}"
+             + (f", API kWh x{kwh_correction:.2f}" if kwh_correction != 1.0
+                else "") + ")",
              series["range_kwh"], rolling_kwh, planning_kwh),
         ],
         window_days=window_days,
@@ -634,9 +846,11 @@ def main(argv: list[str] | None = None) -> int:
         plan_min_pct=float(config["analysis"]["plan_min_pct"]),
         vehicle_name=vehicle_name,
         show=args.show,
+        unit_label=unit_label,
     )
     print_summary(records, series, skipped, rolling_pct, rolling_kwh,
-                  window_days, plan_factor)
+                  window_days, plan_factor, unit_label, unit_factor,
+                  kwh_correction, correction_note)
     return 0
 
 

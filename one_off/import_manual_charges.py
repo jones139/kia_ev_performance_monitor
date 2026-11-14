@@ -34,11 +34,16 @@ What this script produces:
         Dates the API already covers are never touched.
 
 Because the spreadsheet has no times of day, nominal times are assumed
-(constants below): home charges run overnight (start ~23:30 the previous
-evening, end ~07:30); away/en-route charges are placed mid-day
-(start ~11:00, end ~12:00 on the recorded date).  analyze.py pairs each
-day's first morning sample with the last evening sample AFTER it, so
-mid-day away charges cannot invert a day's pair.
+(constants below): a home charge started on the recorded date's evening
+(~23:30) and ended the next morning (~07:30); away/en-route charges are
+placed mid-day (start ~11:00, end ~12:00 on the recorded date).  The
+"evening of the recorded date" convention was verified against the API's
+per-day distances: pairing each period's odometer delta with the API days
+from the charge end to the next charge start matches within a few percent
+(treating the date as the completion morning instead mismatched by up to
+2.5x).  analyze.py pairs each day's first morning sample with the last
+evening sample AFTER it, so mid-day away charges cannot invert a day's
+pair.
 
 Re-running is safe: rows tagged source="manual*"/"manual_derived" are
 removed and regenerated from the spreadsheet each time; rows written by
@@ -74,8 +79,8 @@ COL_LOCATION, COL_NOTES = 9, 25
 REGISTRATION_CELL = "A2"
 
 # Nominal times of day (the spreadsheet records dates only).
-HOME_CHARGE_END = time(7, 30)        # post_charge sample time, home charges
-HOME_CHARGE_START = time(23, 30)     # pre_charge sample time, previous evening
+HOME_CHARGE_START = time(23, 30)     # pre_charge sample time, recorded evening
+HOME_CHARGE_END = time(7, 30)        # post_charge sample time, next morning
 AWAY_CHARGE_START = time(11, 0)      # pre_charge sample time, en-route charges
 AWAY_CHARGE_END = time(12, 0)        # post_charge sample time, en-route charges
 DERIVED_DAY_START = time(0, 1)       # manual_derived post_charge sample time
@@ -110,15 +115,21 @@ class ChargeEvent:
         return (self.location or "").strip().lower() == "home"
 
     def start_datetime(self) -> datetime:
-        """Nominal charge-start datetime (previous evening when at home)."""
-        day = self.date - timedelta(days=1) if self.is_home else self.date
+        """Nominal charge-start datetime on the recorded date.
+
+        Home charges are assumed to have started at ~23:30 on the recorded
+        date (the sheet records the day the car was plugged in); away
+        charges started at ~11:00 the same day.
+        """
         stamp = HOME_CHARGE_START if self.is_home else AWAY_CHARGE_START
-        return datetime.combine(day, stamp)
+        return datetime.combine(self.date, stamp)
 
     def end_datetime(self) -> datetime:
-        """Nominal charge-end datetime on the recorded date."""
-        stamp = HOME_CHARGE_END if self.is_home else AWAY_CHARGE_END
-        return datetime.combine(self.date, stamp)
+        """Nominal charge-end datetime (next morning for home charges)."""
+        if self.is_home:
+            return datetime.combine(self.date + timedelta(days=1),
+                                    HOME_CHARGE_END)
+        return datetime.combine(self.date, AWAY_CHARGE_END)
 
 
 @dataclass
@@ -427,7 +438,7 @@ def write_reference_csv(path: Path, events: list[ChargeEvent],
                 "period", "", "",
                 period.start.isoformat(timespec="minutes"),
                 period.end.isoformat(timespec="minutes"),
-                period.soc_from, period.soc_to, "", "", "",
+                period.soc_from, period.soc_to, "", "", "", "",
                 period.distance_km, round(period.pct_drop, 2),
                 period.days[0].isoformat() + ".." + period.days[-1].isoformat(),
                 "",

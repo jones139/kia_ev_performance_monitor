@@ -65,8 +65,20 @@ timezone = ""
 retry_count = 2            # extra attempts if the Kia Connect API call fails
 retry_delay_seconds = 30   # pause between attempts
 
+[publish]
+output_dir = "publish"                  # static site folder (created on demand)
+title = "Kia EV range report"           # page heading
+recent_days = 14                        # rows in the "recent days" table
+
 [analysis]
-rolling_window_days = 7           # rolling-average window (calendar days)
+rolling_window_days = 28           # rolling-average window (calendar days)
+output_units = "miles"               # units for the summary and graph: "km" or "miles"
+api_energy_correction = "auto"     # method 2: scale the API's kWh to battery
+                                   # energy. "auto" uses the energy accounting;
+                                   # a number >= 1 forces a fixed factor.
+                                   # (The car meters motor-side energy and
+                                   # omits drivetrain losses, so its daily kWh
+                                   # are ~20-25% below what leaves the battery.)
 plan_max_pct = 100                # planning range assumes we start at this SOC
 plan_min_pct = 20                 # ... and only discharge down to this SOC
 min_pct_delta = 2                 # min battery-% drop for the %-based estimate
@@ -75,3 +87,4 @@ min_kwh_used = 0.2                # min daily kWh for the kWh-based estimate
 capacity_check_min_pct_delta = 5  # min battery-% drop for the implied-capacity diagnostic
 min_range_km = 150                # plausibility band: a full-charge range
 max_range_km = 500                # estimate outside this is rejected (glitch)
+                                  # (band always applies to km estimates)

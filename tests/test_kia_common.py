@@ -70,6 +70,7 @@ class LoadConfigTest(unittest.TestCase):
         for section in ("vehicle", "paths", "schedule", "api", "analysis"):
             self.assertIn(section, config)
         self.assertEqual(config["analysis"]["plan_min_pct"], 20)
+        self.assertEqual(config["analysis"]["output_units"], "km")
 
     def test_missing_file_raises(self):
         """A non-existent config path must raise FileNotFoundError."""
