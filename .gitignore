@@ -8,6 +8,7 @@ publish/
 # Python
 __pycache__/
 *.pyc
+venv
 
 # Editor backups
 *~
